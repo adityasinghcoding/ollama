@@ -99,7 +99,7 @@ type llmServer struct {
 
 	// textProcessor handles text encoding/decoding for the model in the Ollama engine
 	// nil if this server is running the llama.cpp based engine
-	textProcessor model.TextProcessor
+	ollamaModel model.Model
 
 	totalLayers  uint64
 	loadStart    time.Time // Record how long it took the model to load
@@ -145,11 +145,11 @@ func LoadModel(model string, maxArraySize int) (*ggml.GGML, error) {
 // NewLlamaServer will run a server for the given GPUs
 func NewLlamaServer(gpus discover.GpuInfoList, modelPath string, f *ggml.GGML, adapters, projectors []string, opts api.Options, numParallel int) (LlamaServer, error) {
 	var llamaModel *llama.Model
-	var textProcessor model.TextProcessor
+	var ollamaModel model.Model
 	var err error
 	if envconfig.NewEngine() || f.KV().OllamaEngineRequired() {
 		if len(projectors) == 0 {
-			textProcessor, err = model.NewTextProcessor(modelPath)
+			ollamaModel, err = model.New(modelPath, ml.BackendParams{})
 		} else {
 			err = errors.New("split vision models aren't supported")
 		}
@@ -158,7 +158,7 @@ func NewLlamaServer(gpus discover.GpuInfoList, modelPath string, f *ggml.GGML, a
 			slog.Debug("model not yet supported by Ollama engine, switching to compatibility mode", "model", modelPath, "error", err)
 		}
 	}
-	if textProcessor == nil {
+	if ollamaModel == nil {
 		llamaModel, err = llama.LoadModelFromFile(modelPath, llama.ModelParams{VocabOnly: true})
 		if err != nil {
 			return nil, err
@@ -293,7 +293,7 @@ func NewLlamaServer(gpus discover.GpuInfoList, modelPath string, f *ggml.GGML, a
 			port = rand.Intn(65535-49152) + 49152 // get a random port in the ephemeral range
 		}
 		params := []string{"runner"}
-		if textProcessor != nil {
+		if ollamaModel != nil {
 			// New engine
 			// TODO - if we have failure to load scenarios, add logic to retry with the old runner
 			params = append(params, "--ollama-engine")
@@ -346,7 +346,7 @@ func NewLlamaServer(gpus discover.GpuInfoList, modelPath string, f *ggml.GGML, a
 			loadRequest:    loadRequest,
 			llamaModel:     llamaModel,
 			llamaModelLock: &sync.Mutex{},
-			textProcessor:  textProcessor,
+			ollamaModel:    ollamaModel,
 			numParallel:    numParallel,
 			sem:            semaphore.NewWeighted(int64(numParallel)),
 			totalLayers:    f.KV().BlockCount() + 1,
@@ -432,7 +432,7 @@ func NewLlamaServer(gpus discover.GpuInfoList, modelPath string, f *ggml.GGML, a
 			}
 		}()
 
-		if textProcessor != nil {
+		if ollamaModel != nil {
 			return &ollamaServer{llmServer: s}, nil
 		} else {
 			return &llamaServer{llmServer: s, ggml: f}, nil
@@ -547,7 +547,7 @@ func (s *llamaServer) Load(ctx context.Context, gpus discover.GpuInfoList, requi
 	s.loadRequest.GPULayers = createGPULayers(s.estimate, s.ggml, gpus, s.options.NumGPU)
 
 	// Mmap is only supported on the llama engine
-	if s.textProcessor == nil {
+	if s.ollamaModel == nil {
 		s.loadRequest.UseMmap = true
 
 		// mmap has issues with partial offloading on metal
@@ -582,7 +582,7 @@ func (s *llamaServer) Load(ctx context.Context, gpus discover.GpuInfoList, requi
 
 	// On the Ollama engine, we can print out a summary of the memory allocations.
 	// We don't have this for the llama engine but it does something similar itself.
-	if s.textProcessor != nil {
+	if s.ollamaModel != nil {
 		resp.Memory.Log(slog.LevelInfo)
 	}
 
@@ -594,7 +594,7 @@ func (s *llamaServer) Load(ctx context.Context, gpus discover.GpuInfoList, requi
 	// The llama engine does its memory allocations together with model loading, so we
 	// need to wait until it is done to ensure that we have accurate memory data before
 	// loading the next model
-	if s.textProcessor == nil {
+	if s.ollamaModel == nil {
 		return s.WaitUntilRunning(ctx)
 	} else {
 		return nil
@@ -1621,17 +1621,19 @@ func (s *llmServer) Tokenize(ctx context.Context, content string) ([]int, error)
 
 	if s.llamaModel != nil {
 		return s.llamaModel.Tokenize(content, false, true)
-	}
-	if s.textProcessor != nil {
-		tokens, err := s.textProcessor.Encode(content, false)
-		if err != nil {
-			return nil, err
+	} else if s.ollamaModel != nil {
+		textProcessor, ok := s.ollamaModel.(model.TextProcessor)
+		if ok {
+			tokens, err := textProcessor.Encode(content, false)
+			if err != nil {
+				return nil, err
+			}
+			toks := make([]int, len(tokens))
+			for i, t := range tokens {
+				toks[i] = int(t)
+			}
+			return toks, nil
 		}
-		toks := make([]int, len(tokens))
-		for i, t := range tokens {
-			toks[i] = int(t)
-		}
-		return toks, nil
 	}
 	// not reached
 	return nil, fmt.Errorf("no tokenizer configured")
@@ -1655,17 +1657,19 @@ func (s *llmServer) Detokenize(ctx context.Context, tokens []int) (string, error
 			resp += s.llamaModel.TokenToPiece(token)
 		}
 		return resp, nil
-	}
-	if s.textProcessor != nil {
-		toks := make([]int32, len(tokens))
-		for i, t := range tokens {
-			toks[i] = int32(t)
+	} else if s.ollamaModel != nil {
+		textProcessor, ok := s.ollamaModel.(model.TextProcessor)
+		if ok {
+			toks := make([]int32, len(tokens))
+			for i, t := range tokens {
+				toks[i] = int32(t)
+			}
+			content, err := textProcessor.Decode(toks)
+			if err != nil {
+				return "", err
+			}
+			return content, nil
 		}
-		content, err := s.textProcessor.Decode(toks)
-		if err != nil {
-			return "", err
-		}
-		return content, nil
 	}
 	// not reached
 	return "", fmt.Errorf("no tokenizer configured")

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	_ "image/jpeg"
 	_ "image/png"
-	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -15,7 +14,6 @@ import (
 	_ "golang.org/x/image/webp"
 
 	"github.com/ollama/ollama/fs"
-	fsggml "github.com/ollama/ollama/fs/ggml"
 	"github.com/ollama/ollama/kvcache"
 	"github.com/ollama/ollama/logutil"
 	"github.com/ollama/ollama/ml"
@@ -127,36 +125,6 @@ func New(modelPath string, params ml.BackendParams) (Model, error) {
 	v := reflect.ValueOf(m)
 	v.Elem().Set(populateFields(base, v.Elem()))
 	return m, nil
-}
-
-func NewTextProcessor(s string) (TextProcessor, error) {
-	r, err := os.Open(s)
-	if err != nil {
-		return nil, err
-	}
-	defer r.Close()
-	meta, err := fsggml.Decode(r, -1)
-	if err != nil {
-		return nil, err
-	}
-	return getTextProcessor(meta.KV())
-}
-
-func getTextProcessor(kv fsggml.KV) (TextProcessor, error) {
-	arch := kv.Architecture()
-	f, ok := models[arch]
-	if !ok {
-		return nil, fmt.Errorf("unsupported model architecture %q", arch)
-	}
-	m, err := f(kv)
-	if err != nil {
-		return nil, err
-	}
-	tp, ok := m.(TextProcessor)
-	if !ok {
-		return nil, fmt.Errorf("%v is not a TextProcessor", m)
-	}
-	return tp, nil
 }
 
 func populateFields(base Base, v reflect.Value, tags ...Tag) reflect.Value {
